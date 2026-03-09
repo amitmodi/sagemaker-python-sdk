@@ -1,0 +1,80 @@
+# ─────────────────────────────────────────────
+# SageMaker Python SDK Auto Bug-Fix Bot Config
+# ─────────────────────────────────────────────
+
+# Target repository
+repo:
+  owner: "aws"
+  name: "sagemaker-python-sdk"
+  default_branch: "master"
+
+# AI model configuration
+ai:
+  # Provider: "anthropic" or "bedrock"
+  provider: "anthropic"
+  model: "claude-opus-4-20250514"
+  max_tokens: 8192
+  temperature: 0.0
+  # Max tool-use iterations before giving up
+  max_iterations: 25
+
+  # Bedrock-specific settings (used when provider=bedrock)
+  bedrock:
+    region: "us-west-2"
+    model_id: "anthropic.claude-sonnet-4-20250514-v1:0"
+
+# Safety guardrails
+guardrails:
+  # Maximum number of files the bot can modify
+  max_files_changed: 5
+  # Maximum total lines added + deleted
+  max_lines_changed: 500
+  # Tests must pass before creating PR
+  require_tests_pass: true
+  # Confidence threshold (0.0 - 1.0): below this → draft PR
+  confidence_threshold: 0.7
+  # Max auto-fix attempts per day (across all issues)
+  daily_rate_limit: 5
+  # Components the bot is allowed to fix (empty = all)
+  allowed_components:
+    - "pipelines"
+    - "training"
+    - "processing"
+    - "inference"
+  # Labels that should block auto-fix
+  excluded_labels:
+    - "wontfix"
+    - "won't fix"
+    - "needs-triage"
+    - "duplicate"
+    - "question"
+    - "feature-request"
+
+# PR creation settings
+pr:
+  # Branch name template
+  branch_template: "auto-fix/issue-{issue_number}"
+  # Commit message template
+  commit_template: "fix: {short_description} (fixes #{issue_number})"
+  # Labels to add to the PR
+  labels:
+    - "auto-generated"
+  # Create as draft if confidence is low
+  draft_on_low_confidence: true
+  # Comment on the original issue
+  comment_on_issue: true
+
+# Logging
+logging:
+  level: "INFO"
+  # Directory for log files (relative to workspace root)
+  dir: "logs"
+  # Keep agent conversation history
+  save_conversation: true
+
+# Workspace settings
+workspace:
+  # Directory for cloning the repo
+  dir: "workspace"
+  # Clean up after run
+  cleanup: false

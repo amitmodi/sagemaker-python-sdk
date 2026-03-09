@@ -1,0 +1,145 @@
+# Auto Bug-Fix Bot — triggers when an issue is labeled `type: bug`
+# Creates a PR with an AI-generated fix for pattern-based bugs.
+#
+# Safety:
+#   - Rate limited to 5 runs/day (checked via GitHub API)
+#   - Concurrency group prevents parallel runs
+#   - PRs are never auto-merged — human review required
+#   - Bot code has 8 layers of guardrails (see docs/design.md)
+
+name: Auto Bug Fix
+
+on:
+  issues:
+    types: [labeled]
+
+# Only one bot run at a time — prevents duplicate PRs and git state corruption
+concurrency:
+  group: auto-bug-fix
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  auto-fix:
+    # Only run when the `type: bug` label is added
+    if: github.event.label.name == 'type: bug'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check rate limit
+        id: rate-check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Count bot PRs created today
+            const today = new Date().toISOString().split('T')[0];
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'all',
+              sort: 'created',
+              direction: 'desc',
+              per_page: 20,
+            });
+            const botPRsToday = prs.filter(pr =>
+              pr.user.login === 'github-actions[bot]' &&
+              pr.labels.some(l => l.name === 'auto-generated') &&
+              pr.created_at.startsWith(today)
+            ).length;
+            
+            const DAILY_LIMIT = 5;
+            if (botPRsToday >= DAILY_LIMIT) {
+              core.setFailed(`Rate limit reached: ${botPRsToday}/${DAILY_LIMIT} bot PRs today`);
+              return;
+            }
+            core.info(`Rate check passed: ${botPRsToday}/${DAILY_LIMIT} bot PRs today`);
+
+      - name: Check for existing bot PR
+        id: existing-pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueNumber = context.payload.issue.number;
+            const branchName = `auto-fix/issue-${issueNumber}`;
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              head: `${context.repo.owner}:${branchName}`,
+            });
+            if (prs.length > 0) {
+              core.setFailed(`PR already exists for issue #${issueNumber}: ${prs[0].html_url}`);
+              return;
+            }
+            core.info(`No existing PR for issue #${issueNumber}`);
+
+      - name: Skip if issue is closed or has blocking labels
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+            if (issue.state === 'closed') {
+              core.setFailed('Issue is already closed');
+              return;
+            }
+            const blockingLabels = ['wontfix', "won't fix", 'duplicate', 'needs-triage', 'question', 'feature-request'];
+            const issueLabels = issue.labels.map(l => l.name.toLowerCase());
+            const blocked = issueLabels.filter(l => blockingLabels.includes(l));
+            if (blocked.length > 0) {
+              core.setFailed(`Issue has blocking label(s): ${blocked.join(', ')}`);
+              return;
+            }
+
+      - name: Extract component from labels
+        id: component
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const labels = context.payload.issue.labels.map(l => l.name);
+            const componentLabel = labels.find(l => l.startsWith('component:'));
+            const component = componentLabel ? componentLabel.split(':')[1].trim() : 'unknown';
+            core.setOutput('name', component);
+            core.info(`Component: ${component}`);
+
+      - name: Checkout bot code
+        uses: actions/checkout@v4
+        with:
+          # Check out the bot code from the tools/auto-fix-bot directory
+          sparse-checkout: tools/auto-fix-bot
+          path: bot-source
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install bot dependencies
+        run: |
+          cd bot-source/tools/auto-fix-bot
+          pip install -r requirements.txt
+          pip install -e .
+
+      - name: Run auto-fix bot
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
+        run: |
+          cd bot-source/tools/auto-fix-bot
+          python -m bot.main \
+            --issue ${{ github.event.issue.number }} \
+            --repo ${{ github.repository }} \
+            --component "${{ steps.component.outputs.name }}"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-logs-${{ github.event.issue.number }}
+          path: bot-source/tools/auto-fix-bot/logs/
+          retention-days: 30
