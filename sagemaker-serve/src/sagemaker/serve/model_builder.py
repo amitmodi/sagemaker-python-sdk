@@ -2888,6 +2888,69 @@ class ModelBuilder(_InferenceRecommenderMixin, _ModelBuilderServers, _ModelBuild
 
             return core_endpoint
 
+    def _try_derive_ic_resource_requirements(
+        self, initial_instance_count: int = 1, endpoint_type: Optional[EndpointType] = None
+    ) -> Optional[ResourceRequirements]:
+        """Try to auto-derive ResourceRequirements for IC-based deployment.
+
+        Uses the 8-gate algorithm from ic_utils to determine if the current
+        deployment configuration is compatible with INFERENCE_COMPONENT_BASED
+        endpoints, and if so, derives the appropriate ResourceRequirements.
+
+        Args:
+            initial_instance_count: Number of initial instances for the endpoint.
+            endpoint_type: Explicit endpoint type from the user, if any.
+
+        Returns:
+            ResourceRequirements if IC-based deployment is appropriate,
+            None if deployment should use MODEL_BASED (opt-out or incompatible).
+        """
+        try:
+            from sagemaker.serve.utils.ic_utils import derive_resource_requirements
+
+            derived_rr = derive_resource_requirements(
+                endpoint_type=endpoint_type,
+                model=self.model,
+                model_server=str(self.model_server) if self.model_server else None,
+                instance_type=self.instance_type,
+                region=self.region,
+                initial_instance_count=initial_instance_count,
+                resource_requirements=None,
+                model_id=self.model if isinstance(self.model, str) else None,
+                sagemaker_session=self.sagemaker_session,
+            )
+
+            # Post-derivation validation: ensure min_memory is set and positive
+            if derived_rr is not None and (
+                derived_rr.min_memory is None or derived_rr.min_memory <= 0
+            ):
+                logger.warning(
+                    "IC-default derivation returned invalid min_memory=%s. "
+                    "Falling back to MODEL_BASED.",
+                    derived_rr.min_memory,
+                )
+                return None
+
+            if derived_rr is not None:
+                logger.info(
+                    "Deploying with INFERENCE_COMPONENT_BASED endpoint (IC-default). "
+                    "ResourceRequirements: memory=%s MB, cpus=%s, accelerators=%s, copies=%s. "
+                    "To opt out, pass endpoint_type=EndpointType.MODEL_BASED "
+                    "or set SAGEMAKER_IC_DEFAULT=false.",
+                    derived_rr.min_memory,
+                    derived_rr.num_cpus,
+                    derived_rr.num_accelerators,
+                    derived_rr.copy_count,
+                )
+
+            return derived_rr
+
+        except ValueError as e:
+            logger.info(
+                "IC-default derivation not applicable: %s. Using MODEL_BASED endpoint.", e
+            )
+            return None
+
     def _deploy(self, **kwargs):
         self.accept_eula = kwargs.get("accept_eula", getattr(self, "accept_eula", False))
         self.built_model = kwargs.get("built_model", getattr(self, "built_model", None))
@@ -3924,6 +3987,7 @@ class ModelBuilder(_InferenceRecommenderMixin, _ModelBuilderServers, _ModelBuild
                 ResourceRequirements,
             ]
         ] = None,
+        endpoint_type: Optional[EndpointType] = None,
         custom_orchestrator_instance_type: str = None,
         custom_orchestrator_initial_instance_count: int = None,
         **kwargs,
@@ -3932,6 +3996,16 @@ class ModelBuilder(_InferenceRecommenderMixin, _ModelBuilderServers, _ModelBuild
 
         Creates a SageMaker ``EndpointConfig`` and deploys an ``Endpoint`` resource from the
         model created by build(). The model must be built before calling deploy().
+
+        By default, this method attempts to deploy using INFERENCE_COMPONENT_BASED endpoints
+        with auto-derived ResourceRequirements (IC-default). If the model, instance type, or
+        region is not compatible with Inference Components, it falls back to MODEL_BASED
+        endpoints automatically.
+
+        To opt out of IC-default behavior, use one of:
+        - ``endpoint_type=EndpointType.MODEL_BASED`` parameter
+        - ``SAGEMAKER_IC_DEFAULT=false`` environment variable
+        - SageMaker config YAML: ``SageMaker.PythonSDK.InferenceComponentDefault: false``
 
         Note: This returns a ``sagemaker.core.resources.Endpoint`` object, not the deprecated
         PySDK Predictor class. Use endpoint.invoke() to make predictions.
@@ -3954,6 +4028,10 @@ class ModelBuilder(_InferenceRecommenderMixin, _ModelBuilderServers, _ModelBuild
             inference_config (Union[ServerlessInferenceConfig, AsyncInferenceConfig,
                 BatchTransformInferenceConfig, ResourceRequirements], optional): Unified inference
                 configuration parameter. Can be used instead of individual config parameters.
+                (Default: None).
+            endpoint_type (EndpointType, optional): The type of endpoint to create. If None,
+                IC-default auto-derivation is attempted. Set to
+                ``EndpointType.MODEL_BASED`` to explicitly opt out of IC-default.
                 (Default: None).
             custom_orchestrator_instance_type (str, optional): Instance type for custom
                 orchestrator deployment. (Default: None).
@@ -4010,15 +4088,35 @@ class ModelBuilder(_InferenceRecommenderMixin, _ModelBuilderServers, _ModelBuild
         if not hasattr(self, "_deployables"):
 
             if not inference_config:
-                deploy_kwargs = {
-                    "instance_type": self.instance_type,
-                    "initial_instance_count": initial_instance_count,
-                    "endpoint_name": endpoint_name,
-                    "update_endpoint": update_endpoint,
-                    "container_timeout_in_seconds": container_timeout_in_seconds,
-                    "wait": wait,
-                    "endpoint_type": EndpointType.MODEL_BASED,
-                }
+                # IC-default: try to auto-derive ResourceRequirements for IC-based deployment
+                derived_rr = self._try_derive_ic_resource_requirements(
+                    initial_instance_count=initial_instance_count,
+                    endpoint_type=endpoint_type,
+                )
+
+                if derived_rr is not None:
+                    # IC-based deployment (auto-derived)
+                    deploy_kwargs = {
+                        "instance_type": self.instance_type,
+                        "initial_instance_count": initial_instance_count,
+                        "endpoint_name": endpoint_name,
+                        "update_endpoint": update_endpoint,
+                        "container_timeout_in_seconds": container_timeout_in_seconds,
+                        "wait": wait,
+                        "endpoint_type": EndpointType.INFERENCE_COMPONENT_BASED,
+                        "resources": derived_rr,
+                    }
+                else:
+                    # MODEL_BASED fallback (original behavior)
+                    deploy_kwargs = {
+                        "instance_type": self.instance_type,
+                        "initial_instance_count": initial_instance_count,
+                        "endpoint_name": endpoint_name,
+                        "update_endpoint": update_endpoint,
+                        "container_timeout_in_seconds": container_timeout_in_seconds,
+                        "wait": wait,
+                        "endpoint_type": endpoint_type or EndpointType.MODEL_BASED,
+                    }
 
                 deploy_kwargs.update(kwargs)
                 return self._deploy(**deploy_kwargs)
